@@ -1,0 +1,11 @@
+# 需 Python 3.11 / 3.12（numpy 1.26 无 cp313 轮子）
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==15.0.2
+scikit-learn==1.4.2
+lightgbm==4.3.0
+# 看板
+streamlit>=1.35
+plotly>=5.22
+# 测试
+pytest==8.2.0

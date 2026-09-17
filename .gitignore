@@ -1,0 +1,21 @@
+# 数据文件（体积大，不进版本库）
+data/raw/*.csv
+data/raw/**/*.csv
+data/processed/*.parquet
+data/processed/*.csv
+
+# 产物
+outputs/*.csv
+outputs/*.parquet
+outputs/*.txt
+outputs/*.png
+outputs/*.html
+
+# 环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+.streamlit/secrets.toml
