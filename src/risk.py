@@ -15,7 +15,9 @@ M5 是零售 POS 数据，不含供应商信息。企业采购主数据（供应
   ① 先生成供应商主表 —— 一家供应商只有一套 OTD / DPPM / 交期 / 财务健康度；
   ② 再生成 SKU-供应商供货关系 —— 一家供应商可服务多个 SKU（符合真实采购格局）；
   ③ 评分在**供应商层面**做（QCDSM 评价的是供应商，不是 SKU）；
-  ④ 断供概率在**供货关系层面**做（同一家供应商，供货给高需求 SKU 的断供风险更高）。
+  ④ 断供概率在**供货关系层面**做（同一家供应商，供货给高需求 SKU 的断供风险更高）；
+  ⑤ 一个 SKU 可挂多家供应商（A/B 类双源、带主备份额），SKU 级断供概率
+     取主备**联合**概率 —— 双源的业务价值在这里被量化出来。
 若每个 SKU 各配一个独立参数的"供应商"，集中度指标（HHI）会失去意义。
 
 方法选择：为什么是「规则评分 + 概率模拟」而不是训练分类器
@@ -66,8 +68,13 @@ def map_items_to_suppliers(panel: pd.DataFrame, suppliers: pd.DataFrame,
                            rng: np.random.Generator) -> pd.DataFrame:
     """
     SKU -> 供应商供货关系。
+
     采购金额越大（ABC 类越靠前）越倾向双源；供应商选择按偏斜分布抽取，
     使少数供应商服务较多 SKU —— 这样集中度指标才有意义。
+
+    双源 SKU 带主备份额（split_ratio）：主供承接大部分需求，备供保持小份额
+    持续下单。这是采购实务的通行做法 —— 备供若长期没有订单，产能响应和
+    商务关系都会退化，真到切换时接不住。主供份额取 0.65~0.85。
     """
     item = (panel.groupby("item_id")
                  .agg(total=("sales", "sum"), cat=("cat_id", "first"))
@@ -87,11 +94,13 @@ def map_items_to_suppliers(panel: pd.DataFrame, suppliers: pd.DataFrame,
     for _, r in item.iterrows():
         k = 2 if r["abc_class"] in ("A", "B") else 1        # 战略/杠杆品双源，长尾单源
         chosen = rng.choice(n_sup, size=k, replace=False, p=attract)
+        split = 1.0 if k == 1 else rng.uniform(0.65, 0.85)  # 主供份额
         for rank, j in enumerate(chosen):
             rows.append({"item_id": r["item_id"], "supplier_id": sid[j],
                          "abc_class": r["abc_class"],
                          "is_primary": rank == 0, "n_sources": k,
                          "is_single_source": k == 1,
+                         "split_ratio": split if rank == 0 else 1.0 - split,
                          "item_total_sales": float(r["total"])})
     return pd.DataFrame(rows)
 
@@ -201,8 +210,8 @@ def run() -> pd.DataFrame:
     df["daily_mean"] = df["daily_mean"].fillna(0.0)
     df["daily_std"] = df["daily_std"].fillna(0.0)
     df["price"] = df["price"].fillna(df["price"].median() if df["price"].notna().any() else 1.0)
-    # 年化采购金额 = 日均需求 × 365 × 单价（用真实价格，不是随机系数）
-    df["annual_spend"] = df["daily_mean"] * 365 * df["price"]
+    # 年化采购金额 = 日均需求 × 365 × 单价 × 份额（双源 SKU 按主备份额分摊到两家）
+    df["annual_spend"] = df["daily_mean"] * 365 * df["price"] * df["split_ratio"]
     df["sigma_d"] = [float(sigma_map.get(i, item_sigma.get(i, 1.0)))
                      for i in df["item_id"]]
     df["sigma_d"] = np.clip(df["sigma_d"], 0.05, None)
@@ -220,6 +229,13 @@ def run() -> pd.DataFrame:
                     "coverage_days_current": cov_now,
                     "coverage_days_needed": need})
     res = pd.DataFrame(out)
+
+    # SKU 级联合断供概率：单源 SKU = 供货关系自身；双源 SKU = 主备同时断供。
+    # 独立性是近似 —— 同区域供应商的风险实际正相关（同一地缘事件同时冲击），
+    # 独立假设会低估联合概率，此边界在 README「假设与边界」中说明。
+    joint = (res.groupby("item_id")["p_stockout"]
+                .agg(p_stockout_sku=lambda p: float(np.prod(p))))
+    res = res.merge(joint, on="item_id", how="left")
 
     # 综合风险分：供应商评分风险（反向）与断供概率各半，仅用于排序
     score_risk = np.clip(100 - res["qcdsm_score"], 0, 100)
@@ -241,9 +257,16 @@ def run() -> pd.DataFrame:
     res.to_csv(C.RISK_FILE, index=False)
     print(f"[supplier] {len(suppliers)} 家供应商 | QCDSM 分层 "
           f"{suppliers['qcdsm_grade'].value_counts().to_dict()}")
-    print(f"[links]    {len(res):,} 条 SKU-供应商关系 | 断供风险 "
+    print(f"[links]    {len(res):,} 条 SKU-供应商关系 | 断供风险（关系级）"
           f"{res['risk_level'].value_counts().to_dict()} "
           f"（目标缺货率 {(1 - C.SERVICE_LEVEL):.0%}）")
+    sku = res.drop_duplicates("item_id")
+    single = sku[sku["is_single_source"]]
+    dual = sku[~sku["is_single_source"]]
+    print(f"[双源]     单源 {len(single)} 个 SKU 平均断供概率 "
+          f"{single['p_stockout_sku'].mean():.1%} | "
+          f"双源 {len(dual)} 个 SKU 联合断供概率 "
+          f"{dual['p_stockout_sku'].mean():.1%}（主备独立近似）")
     share = suppliers.merge(links.groupby("supplier_id")["item_total_sales"].sum().reset_index(),
                             on="supplier_id")
     share["w"] = share["item_total_sales"] / share["item_total_sales"].sum()

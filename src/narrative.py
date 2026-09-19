@@ -92,8 +92,14 @@ def run() -> str:
       f"（{'偏高，存在单点失效风险' if kpi['hhi'] > 0.15 else '尚可'}），最大供应商占采购额 {kpi['top1_share']:.1%}")
     A(f"· 风险等级分布：" + "，".join(f"{k} {v} 条" for k, v in grade.items()))
     A(f"· 平均断供概率 {kpi['avg_stockout_prob']:.2%}"
-      f"（按现行「交期 + {C.CURRENT_SAFETY_DAYS:.0f} 天安全库存」口径测算），"
-      f"单源 SKU 共 {plan['is_single_source'].sum()} 条")
+      f"（按现行「交期 + {C.CURRENT_SAFETY_DAYS:.0f} 天安全库存」口径测算）")
+    sk = plan.drop_duplicates("item_id")
+    s1, s2 = sk[sk["is_single_source"]], sk[~sk["is_single_source"]]
+    if len(s1) and len(s2):
+        A(f"· 单源 {len(s1)} 个 SKU 平均断供概率 {s1['p_stockout_sku'].mean():.1%}；"
+          f"双源 {len(s2)} 个 SKU（主供份额 65%~85%）联合断供概率 "
+          f"{s2['p_stockout_sku'].mean():.1%} —— 双源对冲断供风险的效果直接可见，"
+          f"剩余风险主要来自主备同区域的地缘相关性（本口径按独立近似）")
     A("")
 
     A("【库存侧现状】")
@@ -104,9 +110,10 @@ def run() -> str:
     A("")
 
     A("【行动清单 Top10（按采购金额 × 风险排序）】")
-    A(f"{'供应商':<10}{'SKU':<14}{'区域':<10}{'象限':<6}{'风险':<6}{'断供概率':<10}行动")
+    A(f"{'供应商':<10}{'SKU':<14}{'主/备':<5}{'区域':<10}{'象限':<6}{'风险':<6}{'断供概率':<10}行动")
     for _, r in top.iterrows():
-        A(f"{r['supplier_id']:<10}{r['item_id']:<14}{r['region']:<10}{r['kraljic']:<6}"
+        role = "主" if r["is_primary"] else "备"
+        A(f"{r['supplier_id']:<10}{r['item_id']:<14}{role:<5}{r['region']:<10}{r['kraljic']:<6}"
           f"{r['risk_level']:<6}{r['p_stockout']:<10.1%}{r['action']}")
     A("")
 

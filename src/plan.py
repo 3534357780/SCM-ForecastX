@@ -13,6 +13,10 @@
    「目标库存水位 / 再订货点」，真实落地时对接 WMS 的在手库存做差额。
 3. **分类分档驱动差异化策略**：ABC（金额）× XYZ（需求波动）× Kraljic（支出 × 风险）
    三个维度交叉，对应差异化采购策略，而不是一刀切。
+4. **双源 SKU 按关系口径算水位**：每条供货关系的安全库存与再订货点，
+   基于「该供应商承担的那部分需求」（总需求 × 主备份额）计算 ——
+   向主供下单覆盖 75% 的需求，就按 75% 的口径备水位；σ_d 按份额线性
+   缩放（主备需求同源的保守近似）。
 """
 from __future__ import annotations
 
@@ -60,8 +64,9 @@ def run() -> pd.DataFrame:
     # 需求统计（daily_mean / daily_std / sigma_d）已在 risk 层算好，这里直接复用
     Z = z_value(C.SERVICE_LEVEL)
     L = res["lead_time_days"].to_numpy()
-    sd = res["sigma_d"].to_numpy()
-    dm = res["daily_mean"].to_numpy()
+    # 关系级需求 = SKU 总需求 × 该关系份额（双源 SKU 的主备各自按份额口径备水位）
+    dm = res["daily_mean"].to_numpy() * res["split_ratio"].to_numpy()
+    sd = res["sigma_d"].to_numpy() * res["split_ratio"].to_numpy()   # 主备需求同源的保守近似
     sigma_L = L * C.LEAD_TIME_LN_SIGMA            # 交期标准差（对数正态近似）
 
     # 联合不确定性下的安全库存
@@ -85,13 +90,14 @@ def run() -> pd.DataFrame:
     res["action"] = [ACTION_SOP.get((k, r), "常规监控")
                      for k, r in zip(res["kraljic"], res["risk_level"])]
 
-    # 关键 KPI：供应商集中度（HHI，按采购支出份额）
+    # 关键 KPI：供应商集中度（HHI，按采购支出份额）；断供概率用 SKU 级联合口径
     share = res.groupby("supplier_id")["annual_spend"].sum() / res["annual_spend"].sum()
     hhi = float((share ** 2).sum())
     top1 = float(share.max())
+    sku = res.drop_duplicates("item_id")
     pd.DataFrame([{"hhi": hhi, "top1_share": top1,
                    "avg_safety_stock": float(res["safety_stock"].mean()),
-                   "avg_stockout_prob": float(res["p_stockout"].mean()),
+                   "avg_stockout_prob": float(sku["p_stockout_sku"].mean()),
                    "service_level": C.SERVICE_LEVEL}]).to_csv(
         C.OUT_DIR / "scm_kpis.csv", index=False)
 

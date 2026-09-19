@@ -37,8 +37,10 @@ def run() -> pd.DataFrame:
     rng = np.random.default_rng(C.RANDOM_SEED)
 
     L = res["lead_time_days"].to_numpy()
-    sd = res["sigma_d"].to_numpy()
-    dm = res["daily_mean"].to_numpy()
+    split = res["split_ratio"].to_numpy()
+    # 与 plan 相同的关系级口径：需求与残差都按主备份额折算
+    sd = res["sigma_d"].to_numpy() * split
+    dm = res["daily_mean"].to_numpy() * split
     price = res["price"].to_numpy()
     sigma_L = L * C.LEAD_TIME_LN_SIGMA
     base = np.sqrt(L * sd ** 2 + dm ** 2 * sigma_L ** 2)   # Z 前的联合标准差

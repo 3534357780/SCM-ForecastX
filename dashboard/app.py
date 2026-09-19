@@ -1,5 +1,5 @@
 """
-SCM-ForecastX 决策看板（Streamlit）。
+零售补货计划决策看板（Streamlit）。
 
 启动：
     streamlit run dashboard/app.py
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import config as C
 
-st.set_page_config(page_title="SCM-ForecastX 供应链决策看板", layout="wide")
+st.set_page_config(page_title="零售补货计划看板", layout="wide")
 
 RED, GREEN, BLUE, GREY = "#d62728", "#2ca02c", "#1f77b4", "#8c8c8c"
 
@@ -45,7 +45,7 @@ def load():
 
 
 def main():
-    st.title("SCM-ForecastX · 供应链需求预测与供应商风险驾驶舱")
+    st.title("预测驱动的零售补货计划")
     st.caption(f"数据源：M5 Walmart 真实零售数据（{C.STATE} / {C.STORE} / {C.DEPT}）"
                f"＋ 参数化情景模拟的供应商层")
 
@@ -141,9 +141,11 @@ def main():
 
     st.divider()
     st.subheader("⚠️ 风险预警：优先处理清单")
+    plan = plan.copy()
+    plan["主/备"] = np.where(plan["is_primary"], "主", "备")
     hi = (plan[plan["risk_level"].isin(["高", "极高"])]
           .sort_values("annual_spend", ascending=False)
-          .head(20)[["supplier_id", "item_id", "region", "abc_class", "xyz_class",
+          .head(20)[["supplier_id", "item_id", "主/备", "region", "abc_class", "xyz_class",
                      "kraljic", "risk_level", "qcdsm_score", "p_stockout",
                      "lead_time_days", "safety_stock", "reorder_point", "action"]])
     hi = hi.rename(columns={"supplier_id": "供应商", "item_id": "SKU", "region": "区域",
