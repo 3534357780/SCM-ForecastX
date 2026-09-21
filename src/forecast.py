@@ -15,6 +15,9 @@
 4. **多指标而不是单一 MAE。** WMAPE 规避零销量的分母问题；MASE 以季节性
    naive 为标尺（<1 才算赢过朴素方法）；Bias% 暴露系统性高估/低估。
 5. **预测区间由实测残差给出**，不用模型自报的置信度，供后续安全库存使用。
+6. **训练目标用「还原后的需求」而不是「记录到的销量」**，并保留一个用原始销量
+   训练的对照模型（lgbm_raw）。断货日的记录销量是 0，但需求不是 0；用被截断的
+   记录值训练会让模型系统性低估。两个模型的差值，就是这一步处理的业务价值。
 
 用法
 ----
@@ -45,25 +48,31 @@ FEATURES = [
     "series_id",
 ]
 CATEGORICAL = ["series_id", "dow", "month", "event_type"]
-MODELS = ["naive_last", "seasonal_naive", "ma28",
-          "drift", "holt", "croston", "sba",
-          "lgbm_tweedie"]
+# lgbm_tweedie 用还原后需求训练（主模型）；lgbm_raw 用记录销量训练（对照）
 BASELINES = ["naive_last", "seasonal_naive", "ma28",
              "drift", "holt", "croston", "sba"]
+MODELS = BASELINES + ["lgbm_raw", "lgbm_tweedie"]
 
 
 # ------------------------------------------------------------------ 数据底座
 def to_matrices(panel: pd.DataFrame):
-    """把长表转成矩阵，便于按时间切片做特征。"""
-    ids = np.sort(panel["id"].unique())
-    idx = {v: i for i, v in enumerate(ids)}
+    """把长表转成矩阵，便于按时间切片做特征。
 
-    pivot_s = panel.pivot_table(index="id", columns="t", values="sales", aggfunc="sum")
-    pivot_p = panel.pivot_table(index="id", columns="t", values="price", aggfunc="last")
-    pivot_s = pivot_s.reindex(index=ids)
-    pivot_p = pivot_p.reindex(index=ids)
-    S = pivot_s.to_numpy(dtype=np.float32)
-    P = pivot_p.to_numpy(dtype=np.float32)
+    返回两条销量矩阵：
+      S  = 记录销量（实际卖出去的）
+      Sr = 还原需求（把疑似断货日的记录 0 替换成该序列的正常日销量）
+    M 为促销标记矩阵，供下游把促销波动与基础波动分开。
+    """
+    ids = np.sort(panel["id"].unique())
+
+    def _pivot(col, how, dtype=np.float32):
+        return (panel.pivot_table(index="id", columns="t", values=col, aggfunc=how)
+                     .reindex(index=ids).to_numpy(dtype=dtype))
+
+    S  = _pivot("sales", "sum")
+    Sr = _pivot("sales_restored", "sum")
+    P  = _pivot("price", "last")
+    M  = _pivot("is_promo", "max")
 
     cal = (panel.sort_values("t")
                 .drop_duplicates("t")
@@ -79,7 +88,7 @@ def to_matrices(panel: pd.DataFrame):
     evt_categories = ["无", "Cultural", "National", "Religious", "Sporting"]
     evt_code = pd.Categorical(evt, categories=evt_categories).codes
     has_event = (evt != "无").astype(int).to_numpy()
-    return ids, np.arange(len(ids)), S, P, {
+    return ids, np.arange(len(ids)), S, Sr, M, P, {
         "dow": dow, "month": month, "snap": snap.astype(int),
         "evt_code": evt_code, "has_event": has_event,
         "day_of_month": pd.to_datetime(cal["date"]).dt.day.to_numpy(),
@@ -87,8 +96,12 @@ def to_matrices(panel: pd.DataFrame):
     }
 
 
-def build_rows(S, P, cal, series_idx, origin: int, horizon: int) -> pd.DataFrame:
-    """构造「原点 origin 出发、预测未来 horizon 天」的全部特征行，无未来信息。"""
+def build_rows(S, P, cal, series_idx, origin: int, horizon: int,
+               Sr=None, M=None) -> pd.DataFrame:
+    """构造「原点 origin 出发、预测未来 horizon 天」的全部特征行，无未来信息。
+
+    y 为记录销量（评估口径）；y_restored 为还原需求（训练口径）。
+    """
     n = S.shape[0]
     o = origin
     feats = {"h": np.full(n, horizon, dtype=np.int16)}
@@ -131,7 +144,9 @@ def build_rows(S, P, cal, series_idx, origin: int, horizon: int) -> pd.DataFrame
     feats["series_id"] = series_idx
 
     df = pd.DataFrame(feats)
-    df["y"] = S[:, t]
+    df["y"] = S[:, t]                                        # 记录销量（评估口径）
+    df["y_restored"] = Sr[:, t] if Sr is not None else df["y"]   # 还原需求（训练口径）
+    df["is_promo"] = M[:, t] if M is not None else 0
     df["t"] = t
     df["origin"] = o
     df["date"] = cal["date"][t]
@@ -263,9 +278,24 @@ def metrics(y, yhat) -> dict:
 
 
 # ------------------------------------------------------------------ 主流程
+def _fit_lgbm(train: pd.DataFrame, target: str):
+    """LightGBM + Tweedie 损失。variance_power=1.1 处理零膨胀的计数型需求。"""
+    import lightgbm as lgb
+    model = lgb.LGBMRegressor(
+        objective="tweedie", variance_power=1.1,   # 计数型 + 零膨胀需求
+        n_estimators=450, learning_rate=0.06, num_leaves=63,
+        min_child_samples=60, subsample=0.85, subsample_freq=1,
+        colsample_bytree=0.85, reg_lambda=1.0,
+        random_state=C.RANDOM_SEED, n_jobs=-1, verbose=-1,
+    )
+    model.fit(train[FEATURES], train[target],
+              categorical_feature=[c for c in CATEGORICAL if c in FEATURES])
+    return model
+
+
 def run(use_lgbm: bool = True) -> pd.DataFrame:
     panel = pd.read_parquet(C.PROC_DIR / "panel.parquet")
-    ids, series_idx, S, P, cal = to_matrices(panel)
+    ids, series_idx, S, Sr, M, P, cal = to_matrices(panel)
     n_days = S.shape[1]
     H = C.HORIZON
     print(f"[矩阵] 序列 {S.shape[0]:,} 条 × 天数 {n_days:,}")
@@ -278,23 +308,18 @@ def run(use_lgbm: bool = True) -> pd.DataFrame:
     print(f"[切分] 训练原点 {len(train_origins)} 个（t = {train_origins[0]} ~ {train_origins[-1]}），"
           f"训练最晚目标 t = {train_origins[-1] + H} < 验证起点 {earliest_val}")
 
-    frames = [build_rows(S, P, cal, series_idx, o, h)
+    frames = [build_rows(S, P, cal, series_idx, o, h, Sr=Sr, M=M)
               for o in train_origins for h in range(1, H + 1)]
     train = pd.concat(frames, ignore_index=True)
-    print(f"[训练集] {len(train):,} 行 × {len(FEATURES)} 特征")
+    print(f"[训练集] {len(train):,} 行 × {len(FEATURES)} 特征 | "
+          f"促销日占比 {100 * train['is_promo'].mean():.1f}% | "
+          f"还原使训练目标日均提高 "
+          f"{100 * (train['y_restored'].mean() / max(train['y'].mean(), 1e-9) - 1):+.1f}%")
 
-    model = None
+    model = model_raw = None
     if use_lgbm:
-        import lightgbm as lgb
-        model = lgb.LGBMRegressor(
-            objective="tweedie", variance_power=1.1,   # 计数型 + 零膨胀需求
-            n_estimators=450, learning_rate=0.06, num_leaves=63,
-            min_child_samples=60, subsample=0.85, subsample_freq=1,
-            colsample_bytree=0.85, reg_lambda=1.0,
-            random_state=C.RANDOM_SEED, n_jobs=-1, verbose=-1,
-        )
-        model.fit(train[FEATURES], train["y"],
-                  categorical_feature=[c for c in CATEGORICAL if c in FEATURES])
+        model_raw = _fit_lgbm(train, "y")          # 对照：用记录销量训练
+        model = _fit_lgbm(train, "y_restored")     # 主模型：用还原需求训练
 
     # ---- 逐折滚动评估 ----
     fold_metrics, per_series, rows = [], [], []
@@ -302,15 +327,16 @@ def run(use_lgbm: bool = True) -> pd.DataFrame:
         o = start - 1
         ys, ps, metas = [], {k: [] for k in (MODELS if model else BASELINES)}, []
         for h in range(1, H + 1):
-            df = build_rows(S, P, cal, series_idx, o, h)
+            df = build_rows(S, P, cal, series_idx, o, h, Sr=Sr, M=M)
             y = df["y"].to_numpy()
             b = baselines(S, o, h)
             ys.append(y)
             for k in BASELINES:
                 ps[k].append(b[k])
             if model is not None:
+                ps["lgbm_raw"].append(np.maximum(model_raw.predict(df[FEATURES]), 0))
                 ps["lgbm_tweedie"].append(np.maximum(model.predict(df[FEATURES]), 0))
-            metas.append(df[["series_id", "date", "h", "origin", "y"]].assign(
+            metas.append(df[["series_id", "date", "h", "origin", "y", "is_promo"]].assign(
                 **{f"pred_{k}": ps[k][-1] for k in ps}))
             rows.append({"fold": fold, "h": h, **{
                 k: wmape(y, ps[k][-1]) for k in ps}})
@@ -344,6 +370,28 @@ def run(use_lgbm: bool = True) -> pd.DataFrame:
     print("\n注：MASE < 1 表示优于季节性 naive；Bias% 为正表示系统性高估。")
     stats.to_csv(C.OUT_DIR / "metrics_full.csv", index=False)
     allps.to_parquet(C.OUT_DIR / "backtest_predictions.parquet", index=False)
+
+    # ---- 需求还原的效果（记录销量训练 vs 还原需求训练）----
+    if model is not None:
+        eff = []
+        segs = [("全部日", np.ones(len(allps), dtype=bool)),
+                ("非促销日", (allps["is_promo"] == 0).to_numpy()),
+                ("促销日", (allps["is_promo"] == 1).to_numpy())]
+        for name, label in [("lgbm_raw", "记录销量训练"), ("lgbm_tweedie", "还原需求训练")]:
+            yhat = allps[f"pred_{name}"].to_numpy()
+            for seg, msk in segs:
+                eff.append({"model": label, "segment": seg, **metrics(y_all[msk], yhat[msk])})
+        eff = pd.DataFrame(eff)
+        eff.to_csv(C.OUT_DIR / "censoring_effect.csv", index=False)
+        print("\n=== 需求还原的效果（同一模型结构，只换训练目标）===")
+        piv = eff.pivot(index="segment", columns="model",
+                        values=["WMAPE", "Bias%"]).round(4)
+        print(piv.to_string())
+        b_raw = eff[(eff.model == "记录销量训练") & (eff.segment == "全部日")]["Bias%"].iloc[0]
+        b_res = eff[(eff.model == "还原需求训练") & (eff.segment == "全部日")]["Bias%"].iloc[0]
+        print(f"[还原] 全期偏差从 {b_raw:+.1f}% 收敛到 {b_res:+.1f}%"
+              f"（绝对值收窄 {abs(b_raw) - abs(b_res):.1f} 个百分点）")
+        print(f"[输出] {C.OUT_DIR / 'censoring_effect.csv'}")
     print(f"\n[输出] {C.OUT_DIR / 'metrics_full.csv'}")
     print(f"[输出] {C.OUT_DIR / 'backtest_predictions.parquet'}")
     return stats

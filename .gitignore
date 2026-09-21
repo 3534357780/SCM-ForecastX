@@ -18,4 +18,6 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .pytest_cache/
+pytest-cache-files-*/
+run.log
 .streamlit/secrets.toml

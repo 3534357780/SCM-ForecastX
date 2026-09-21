@@ -1,17 +1,31 @@
 """
-数据准备：把 M5 的宽表销量数据转换成「序列 × 日期」的长表，并对齐
-日历（含节假日 / SNAP）与周度价格。
+数据准备：把 M5 的宽表销量数据转换成「序列 × 日期」的长表，对齐日历与周度价格，
+并完成一件事：**区分「没有需求」与「有需求但没货」**。
+
+为什么必须做这一步
+------------------
+零售的日销量为 0 有两种成因。真的没有需求，和当天没货可卖。M5 里 53% 的日销量是 0，
+其中一部分是断货造成的 —— 这类零是**被截断的需求**（censored demand），需求实际存在，
+只是没有被记录。把它们原样当 0 送进模型，模型会学到「这个 SKU 就是卖不动」，
+预测系统性偏低；偏低的预测又让下一轮备货更保守，缺货继续发生。
+
+处理方式（两条规则，全部只用当日及以前的信息，因此可安全用于训练输入）：
+  规则 1  促销日 + 零销量 —— 打折还卖不掉，几乎只可能是货没到架
+  规则 2  零销量，但该序列过去 28 天零销占比低于 25% —— 平时天天有销量的 SKU 突然挂零
+判定为缺货的日，用「过去 56 天非促销、非零销日的中位数」还原。用中位数而非均值，
+是为了消除系统性低估而不是放大需求。
+
+规则的取舍由数据决定，不靠直觉（见 README §3.1 的规则有效性检验）
+----------------------------------------------------------------
+曾考虑再加一条「连续零销 ≥ 3 天」。但把它单独拉出来检验后发现：被这条规则判定的日子，
+其后 7 天的销量只恢复到该序列常态水平的 28%，明显低于「零销但未判缺货」的 70%。
+也就是说长串零更可能是 SKU 进入停售 / 衰退，而不是断货 —— 把它当断货还原，
+等于把「停售」误读成「需求」。因此这条规则被舍弃，只用证据支持的两条。
+
+同时标记促销日（价格低于过去 182 天常态价 2% 以上）。促销日单独标记的作用有二：
+一是参与缺货判定，二是让下游把「促销波动」与「基础波动」分开 —— 见 src/risk.py。
 
 产出：data/processed/panel.parquet
-
-设计要点
---------
-1. M5 的宽表（每行一个 SKU-门店，列是 d_1..d_1941）无法直接做特征工程，
-   必须先 melt 成长表；长表是所有时序特征的统一底座。
-2. 日期来自 calendar.csv 的 d -> date 映射，不能靠位置推算，否则节假日
-   与星期会对齐错位。
-3. 价格是周粒度（wm_yr_wk），不能按天插值后再用，否则会产生"未来价格"泄漏。
-   这里只在特征阶段按周回填，且默认使用「上一已知周」价格。
 """
 from __future__ import annotations
 
@@ -88,6 +102,64 @@ def load_prices() -> pd.DataFrame | None:
     return pr
 
 
+def mark_promo(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    促销日标记：当日价格低于「过去 28 天常态价」5% 以上。
+
+    常态价用**过去** 28 天的中位数（先 shift(1) 再 rolling），不用当日及以后的价格 ——
+    这样标记本身不含未来信息，可以安全地进训练。
+    """
+    g = panel.groupby("id", sort=False)["price"]
+    med = g.transform(lambda s: s.shift(1).rolling(
+        C.PROMO_PRICE_WIN, min_periods=C.PROMO_PRICE_MINP).median())
+    panel["price_median_28"] = med
+    panel["is_promo"] = (
+        panel["price"].notna() & med.notna()
+        & (panel["price"] < med * (1 - C.PROMO_PRICE_DROP))
+    ).astype("int8")
+    return panel
+
+
+def detect_and_restore(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    缺货日识别与需求还原。两条规则的含义与取舍见模块 docstring。
+    所有中间量都只依赖当日及以前的数据，因此还原后的序列可以合法用作训练目标。
+
+    zero_run 仍会算出来，但只作为诊断列（用于检验「长串零」是否等于断货），不参与判定。
+    """
+    g = panel.groupby("id", sort=False)
+
+    # 过去 28 天的零销占比（只用历史）
+    panel["zero_ratio_28"] = g["sales"].transform(
+        lambda s: (s == 0).astype(float).shift(1).rolling(28, min_periods=14).mean())
+    # 过去 56 天「非促销且非零销」日的中位数，作为该序列的正常日销量
+    normal_src = panel["sales"].where((panel["is_promo"] == 0) & (panel["sales"] > 0))
+    panel["normal_level"] = normal_src.groupby(panel["id"]).transform(
+        lambda s: s.shift(1).rolling(C.RESTORE_WIN, min_periods=C.RESTORE_MINP).median())
+
+    # 连续零销天数（按序列分块累计）—— 仅用于诊断
+    z = (panel["sales"] == 0).astype("int32")
+    blk = (z == 0).groupby(panel["id"]).cumsum()
+    panel["zero_run"] = z.groupby([panel["id"], blk]).cumsum()
+
+    isnan = panel["normal_level"].isna()
+    r1 = (panel["is_promo"] == 1) & (panel["sales"] == 0)
+    r2 = (panel["sales"] == 0) & (panel["zero_ratio_28"] < C.STOCKOUT_TYPICAL_ZERO)
+    panel["is_stockout"] = ((r1 | r2) & ~isnan).astype("int8")
+
+    panel["sales_restored"] = np.where(panel["is_stockout"] == 1,
+                                       panel["normal_level"], panel["sales"])
+    panel["sales_restored"] = panel["sales_restored"].astype("float32")
+
+    print(f"[信号] 促销日占比 {100 * panel['is_promo'].mean():.1f}% | "
+          f"疑似缺货日占比 {100 * panel['is_stockout'].mean():.1f}%"
+          f"（促销零销 {int(r1.sum()):,} 天 / 热销挂零 {int((r2 & ~r1).sum()):,} 天）")
+    print(f"[信号] 还原前后日均销量变化 "
+          f"{panel['sales_restored'].mean() - panel['sales'].mean():+.3f} 件"
+          f"（{100 * (panel['sales_restored'].mean() / max(panel['sales'].mean(), 1e-9) - 1):+.1f}%）")
+    return panel
+
+
 def build_panel() -> pd.DataFrame:
     sales, dcols = load_sales()
     cal = load_calendar()
@@ -114,6 +186,9 @@ def build_panel() -> pd.DataFrame:
         panel["price"] = panel.groupby("id")["price"].ffill()
     else:
         panel["price"] = np.nan
+
+    panel = mark_promo(panel)
+    panel = detect_and_restore(panel)
 
     C.PROC_DIR.mkdir(parents=True, exist_ok=True)
     out = C.PROC_DIR / "panel.parquet"

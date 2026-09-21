@@ -4,8 +4,8 @@ numpy==1.26.4
 pyarrow==15.0.2
 scikit-learn==1.4.2
 lightgbm==4.3.0
-# 看板
-streamlit>=1.35
+# 看板（1.50+ 才有 width="stretch"，旧的 use_container_width 已废弃）
+streamlit>=1.50
 plotly>=5.22
 # 测试
 pytest==8.2.0
